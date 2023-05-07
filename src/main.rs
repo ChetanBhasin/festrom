@@ -1,21 +1,31 @@
 use std::io::{StdoutLock, Write};
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "type")]
 pub enum Payload {
+    // Maelstrom init payloads
     Init {
         node_id: String,
         node_ids: Vec<String>,
     },
     InitOk,
+
+    // Echo (probably mainly used for heartbeat)
     Echo {
         echo: String,
     },
     EchoOk {
         echo: String,
+    },
+
+    // Used for generating unique IDs
+    Generate,
+    GenerateOk {
+        id: String,
     },
 }
 
@@ -60,15 +70,21 @@ impl Message {
 }
 
 struct Node<'a> {
-    pub out: StdoutLock<'a>,
+    node_id: Option<String>,
+    out: StdoutLock<'a>,
 }
 
 impl Node<'_> {
+    fn update_node_id(&mut self, node_id: String) {
+        self.node_id = Some(node_id);
+    }
+
     fn recv(&mut self, msg: Message) {
         use Payload::*;
 
         match &msg.body.message {
-            Init { .. } => {
+            Init { node_id, .. } => {
+                self.update_node_id(node_id.to_owned());
                 msg.send(Payload::InitOk, &mut self.out);
             }
             Echo { echo } => {
@@ -79,7 +95,17 @@ impl Node<'_> {
                     &mut self.out,
                 );
             }
-            _ => {}
+            Generate => {
+                let id = Ulid::new().to_string();
+                let node = self
+                    .node_id
+                    .clone()
+                    .unwrap_or_else(|| panic!("Uninitizlied node got a generate message"));
+                let id = format!("{}-{}", node, id);
+                msg.send(GenerateOk { id }, &mut self.out);
+            }
+
+            InitOk | EchoOk { .. } | GenerateOk { .. } => {}
         }
     }
 }
@@ -87,7 +113,7 @@ impl Node<'_> {
 fn main() {
     let stdin = std::io::stdin();
     let out = std::io::stdout().lock();
-    let mut node = Node { out };
+    let mut node = Node { out, node_id: None };
     for line in stdin.lines() {
         let line = line.expect("Unable to read the line from standard input");
         // We are just using the `.expect` function here because this is for testing with
