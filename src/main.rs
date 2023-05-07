@@ -1,4 +1,7 @@
-use std::io::{StdoutLock, Write};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{StdoutLock, Write},
+};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -26,6 +29,24 @@ pub enum Payload {
     Generate,
     GenerateOk {
         id: String,
+    },
+
+    // Used for topology management
+    Topology {
+        topology: HashMap<String, HashSet<String>>,
+    },
+    TopologyOk,
+
+    // Used for broadcasting messages
+    Broadcast {
+        message: usize,
+    },
+    BroadcastOk,
+
+    // Used for reading messages
+    Read,
+    ReadOk {
+        messages: HashSet<usize>,
     },
 }
 
@@ -71,6 +92,8 @@ impl Message {
 
 struct Node<'a> {
     node_id: Option<String>,
+    topology: HashMap<String, HashSet<String>>,
+    messages: HashSet<usize>,
     out: StdoutLock<'a>,
 }
 
@@ -104,8 +127,29 @@ impl Node<'_> {
                 let id = format!("{}-{}", node, id);
                 msg.send(GenerateOk { id }, &mut self.out);
             }
+            Topology { topology } => {
+                self.topology = topology.to_owned();
+                msg.send(TopologyOk, &mut self.out);
+            }
+            Broadcast { message } => {
+                self.messages.extend(vec![*message]);
+                msg.send(BroadcastOk, &mut self.out);
+            }
+            Read => {
+                msg.send(
+                    ReadOk {
+                        messages: self.messages.clone(),
+                    },
+                    &mut self.out,
+                );
+            }
 
-            InitOk | EchoOk { .. } | GenerateOk { .. } => {}
+            InitOk
+            | EchoOk { .. }
+            | GenerateOk { .. }
+            | TopologyOk
+            | BroadcastOk
+            | ReadOk { .. } => {}
         }
     }
 }
@@ -113,7 +157,12 @@ impl Node<'_> {
 fn main() {
     let stdin = std::io::stdin();
     let out = std::io::stdout().lock();
-    let mut node = Node { out, node_id: None };
+    let mut node = Node {
+        out,
+        node_id: None,
+        topology: HashMap::new(),
+        messages: HashSet::new(),
+    };
     for line in stdin.lines() {
         let line = line.expect("Unable to read the line from standard input");
         // We are just using the `.expect` function here because this is for testing with
