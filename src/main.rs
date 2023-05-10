@@ -3,8 +3,23 @@ use std::{
     io::{StdoutLock, Write},
 };
 
+use rand::prelude::IteratorRandom;
+
+use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tokio::time::{self, Duration};
+use tokio_stream::wrappers::{IntervalStream, LinesStream};
+use tokio_stream::StreamExt;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Standard IO Error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Serde JSON error: {0}")]
+    SerdeError(#[from] serde_json::Error),
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,12 +63,17 @@ pub enum Payload {
     ReadOk {
         messages: HashSet<usize>,
     },
+
+    // Used for Gossiping with other nodes
+    Gossip {
+        has_seen: HashSet<usize>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct MessageBody {
-    msg_id: usize,
+    msg_id: Option<usize>,
     in_reply_to: Option<usize>,
     #[serde(rename = "type")]
     #[serde(flatten)]
@@ -69,16 +89,13 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn send(&self, payload: Payload, out: &mut StdoutLock) {
+    pub fn send_message(src: String, dest: String, message: MessageBody, out: &mut StdoutLock) {
         let output = Message {
-            src: self.dest.clone(),
-            dest: self.src.clone(),
-            body: MessageBody {
-                msg_id: &self.body.msg_id + 1,
-                in_reply_to: Some(self.body.msg_id),
-                message: payload,
-            },
+            src,
+            dest,
+            body: message,
         };
+        eprintln!("Writing a message: {:?}", output);
         writeln!(
             out,
             "{}",
@@ -88,6 +105,19 @@ impl Message {
         .expect("Failed to write to stdout");
         out.flush().expect("Failed to flush the stdout");
     }
+
+    pub fn send(&self, payload: Payload, out: &mut StdoutLock) {
+        Self::send_message(
+            self.dest.clone(),
+            self.src.clone(),
+            MessageBody {
+                msg_id: self.body.msg_id.map(|id| id + 1),
+                in_reply_to: self.body.msg_id,
+                message: payload,
+            },
+            out,
+        );
+    }
 }
 
 struct Node<'a> {
@@ -95,19 +125,56 @@ struct Node<'a> {
     topology: HashMap<String, HashSet<String>>,
     messages: HashSet<usize>,
     out: StdoutLock<'a>,
+    node_has_seen: HashMap<String, HashSet<usize>>,
 }
 
 impl Node<'_> {
-    fn update_node_id(&mut self, node_id: String) {
-        self.node_id = Some(node_id);
+    fn find_gossip_messages(&self, has_seen: HashSet<usize>) -> HashSet<usize> {
+        let (seen, mut unseen): (HashSet<_>, HashSet<_>) =
+            self.messages.iter().partition(|msg| has_seen.contains(msg));
+        // I'd only like to send 20% extra gossip - I haven't done much tuning on this though
+        let random_select = (seen.len() as f32 * 0.2) as usize;
+        let mut rng = rand::thread_rng();
+        unseen.extend(seen.iter().choose_multiple(&mut rng, random_select));
+        return unseen;
     }
 
-    fn recv(&mut self, msg: Message) {
+    pub fn gossip(&mut self) {
+        if let Some(node_id) = &self.node_id {
+            if let Some(nodes) = self.topology.get(node_id) {
+                for node in nodes {
+                    let messages = self
+                        .node_has_seen
+                        .get(node)
+                        .map(|has_seen| self.find_gossip_messages(has_seen.clone()))
+                        .unwrap_or(self.messages.clone());
+                    if messages.len() == 0 {
+                        // There is no point sending empty messages
+                        return;
+                    }
+                    Message::send_message(
+                        node_id.clone(),
+                        node.clone(),
+                        MessageBody {
+                            msg_id: None,
+                            in_reply_to: None,
+                            message: Payload::Gossip {
+                                has_seen: messages.clone(),
+                            },
+                        },
+                        &mut self.out,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn recv(&mut self, msg: Message) {
         use Payload::*;
 
         match &msg.body.message {
             Init { node_id, .. } => {
-                self.update_node_id(node_id.to_owned());
+                self.node_id = Some(node_id.to_owned());
                 msg.send(Payload::InitOk, &mut self.out);
             }
             Echo { echo } => {
@@ -143,6 +210,10 @@ impl Node<'_> {
                     &mut self.out,
                 );
             }
+            Gossip { has_seen } => {
+                self.messages.extend(has_seen);
+                self.node_has_seen.insert(msg.src.clone(), has_seen.clone());
+            }
 
             InitOk
             | EchoOk { .. }
@@ -154,23 +225,47 @@ impl Node<'_> {
     }
 }
 
-fn main() {
-    let stdin = std::io::stdin();
+pub enum Event {
+    TransportMessage(Message),
+    Gossip,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
     let out = std::io::stdout().lock();
     let mut node = Node {
         out,
         node_id: None,
         topology: HashMap::new(),
         messages: HashSet::new(),
+        node_has_seen: HashMap::new(),
     };
-    for line in stdin.lines() {
-        let line = line.expect("Unable to read the line from standard input");
-        // We are just using the `.expect` function here because this is for testing with
-        // Malestrong and we'd rather fail and crash than properly handle this issue and log it
-        let message =
-            serde_json::from_str::<Message>(&line).expect("Unable to parse message from the line");
-        node.recv(message);
+
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin);
+    let messages = LinesStream::new(reader.lines()).map(|line| {
+        Ok::<Event, Error>(Event::TransportMessage(
+            serde_json::from_str::<Message>(&line.expect("Failed to read the line"))
+                .expect("Failed to read the message"),
+        ))
+    });
+    let gossip_interval = IntervalStream::new(time::interval(Duration::from_millis(300)))
+        .map(|_| Ok::<Event, Error>(Event::Gossip));
+
+    let mut events = messages.merge(gossip_interval);
+
+    //
+    while let Some(Ok(action)) = events.next().await {
+        match action {
+            Event::TransportMessage(msg) => {
+                eprintln!("Got a message: {:?}", msg);
+                node.recv(msg);
+            }
+            Event::Gossip => node.gossip(),
+        }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -184,7 +279,7 @@ mod tests {
             src: "n1".to_string(),
             dest: "c1".to_string(),
             body: MessageBody {
-                msg_id: 1,
+                msg_id: Some(1),
                 in_reply_to: Some(usize::MIN + 1),
                 message: Payload::EchoOk {
                     echo: "Please echo 35".to_string(),
